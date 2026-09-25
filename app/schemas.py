@@ -246,6 +246,60 @@ class PowerEvaluationOut(BaseModel):
     rays: list[PowerRayOut]
 
 
+class DetectorPowerRequest(PowerRequest):
+    """探测线功率分箱请求：在功率请求基础上增加探测半宽与分箱数。
+
+    观察线即探测线：以其法线逆时针旋转 90° 的单位切向量定义有符号坐标，
+    探测区间为闭区间 [-detector_half_width, +detector_half_width]。
+    """
+
+    detector_half_width: float = Field(
+        gt=0, allow_inf_nan=False, description="探测半宽，必须为正的有限值"
+    )
+    bin_count: int = Field(ge=1, le=1001, description="分箱数，1～1001")
+
+
+class DetectorPowerBinOut(BaseModel):
+    """一个分箱：序号、中心的有符号坐标与沉积功率。"""
+
+    index: int
+    center: float
+    power: float
+
+
+class DetectorPowerRayOut(BaseModel):
+    """单条光线的探测线评估结果；deposited 表示是否参与功率沉积。"""
+
+    emission_angle_deg: float
+    direction: Vec2
+    status: str
+    reason: str | None
+    transmittance_s: float
+    transmittance_p: float
+    power: float
+    observation_point: Vec2 | None
+    coordinate: float | None
+    deposited: bool
+
+
+class DetectorPowerEvaluationOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    s_fraction: float
+    detector_half_width: float
+    bin_count: int
+    bin_width: float
+    ray_count: int
+    hit_count: int
+    deposited_count: int
+    tangent: Vec2
+    total_input_power: float
+    received_power: float
+    unreceived_power: float
+    bins: list[DetectorPowerBinOut]
+    rays: list[DetectorPowerRayOut]
+
+
 class WavefrontRayOut(BaseModel):
     """单条光线的波前评估结果；无效光线的光程/偏移/残差为 null。"""
 

@@ -14,6 +14,10 @@ POST /api/aperture-beam-evaluations   复用光束扇形采样与顺序界面追
                                       （不入库）
 POST /api/power-evaluations           复用光束采样与追迹，按菲涅耳公式逐界面累乘
                                       s/p 透过率，返回各光线功率与功率加权质心
+POST /api/detector-power-evaluations  复用光束扇形采样、顺序界面追迹与菲涅耳
+                                      s/p 透过率，在观察线（探测线）上按有符号
+                                      切向坐标对透过功率线性分箱，返回各箱功率、
+                                      接收总功率与未接收功率（不入库）
 POST /api/wavefront-evaluations       复用光束采样与追迹，计算各光线到观察线的
                                       光程，对 (切向偏移, 光程) 做等权最小二乘
                                       直线拟合，返回截距、斜率、逐光线残差与
@@ -44,6 +48,7 @@ from .geometry import (
     normalize,
     observation_intersection,
     optical_path_length,
+    power_binning,
     ray_transmittance,
     sample_directions,
     trace_ray,
@@ -58,6 +63,8 @@ from .schemas import (
     ApertureBeamRequest,
     BeamEvaluationOut,
     BeamRequest,
+    DetectorPowerEvaluationOut,
+    DetectorPowerRequest,
     FocusSearchOut,
     FocusSearchRequest,
     PowerEvaluationOut,
@@ -351,6 +358,111 @@ def evaluate_power(req: PowerRequest) -> dict:
         "weighted_centroid": (
             None if centroid is None else {"x": centroid[0], "y": centroid[1]}
         ),
+        "rays": rays_out,
+    }
+
+
+@app.post("/api/detector-power-evaluations", response_model=DetectorPowerEvaluationOut)
+def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
+    """复用光束扇形采样、顺序界面追迹与菲涅耳 s/p 透过率，在观察线上功率分箱。
+
+    观察线即探测线：其法线归一化后逆时针旋转 90° 得单位切向量 t，命中坐标
+    s = (观察线交点 − 观察线给定点) · t 为有符号坐标；探测区间为闭区间
+    [-detector_half_width, +detector_half_width]，bin_count 个等宽分箱，中心
+    c_i = -detector_half_width + (i + 0.5)·bin_width，bin_width =
+    2·detector_half_width/bin_count。
+
+    每条采样光线的透过功率沿用功率评估（每条入射功率为 1，power =
+    s_fraction·Ts + (1−s_fraction)·Tp，全反射或漏过界面记零功率）。仅追迹
+    完成（completed）、出射段前向命中观察线且坐标位于闭区间内的光线参与
+    沉积：命中坐标在相邻分箱中心间时按线性权重分给两箱，落在首末中心之外
+    但仍在探测范围内时全量计入边缘箱，分配守恒不丢边缘功率。接收总功率
+    received_power 为各箱功率之和；未接收功率 unreceived_power = 采样光线数
+    （即入射总功率，每条入射功率为 1）− 接收总功率，包含追迹失败、未命中
+    观察线与落在探测区间之外的功率。该接口为即时计算，结果不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    start = req.start.as_tuple()
+    obs_point = req.observation_line.point.as_tuple()
+    obs_normal = req.observation_line.normal.as_tuple()
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    rays_out: list[dict] = []
+    deposited_hits: list[tuple[float, float]] = []  # 参与沉积的 (坐标, 功率)
+    hit_count = 0
+    for angle, direction in sample_directions(
+        req.center_direction.as_tuple(), req.half_angle_deg, req.sample_count
+    ):
+        segments, status, reason = trace_ray(
+            start, direction, req.n_start, interfaces
+        )
+        t_s, t_p = ray_transmittance(segments, status, interfaces)
+        power = req.s_fraction * t_s + (1.0 - req.s_fraction) * t_p
+
+        observation_point = None
+        coordinate = None
+        deposited = False
+        if status == "completed":
+            observation_point = observation_intersection(
+                segments, obs_point, obs_normal
+            )
+            if observation_point is not None:
+                hit_count += 1
+                coordinate = (
+                    (observation_point[0] - obs_point[0]) * tangent[0]
+                    + (observation_point[1] - obs_point[1]) * tangent[1]
+                )
+                if abs(coordinate) <= req.detector_half_width:  # 闭区间，边界计入
+                    deposited = True
+                    deposited_hits.append((coordinate, power))
+
+        rays_out.append(
+            {
+                "emission_angle_deg": angle,
+                "direction": {"x": direction[0], "y": direction[1]},
+                "status": status,
+                "reason": reason,
+                "transmittance_s": t_s,
+                "transmittance_p": t_p,
+                "power": power,
+                "observation_point": (
+                    None
+                    if observation_point is None
+                    else {"x": observation_point[0], "y": observation_point[1]}
+                ),
+                "coordinate": coordinate,
+                "deposited": deposited,
+            }
+        )
+
+    centers, bin_powers = power_binning(
+        deposited_hits, req.detector_half_width, req.bin_count
+    )
+    bin_width = 2.0 * req.detector_half_width / req.bin_count
+    received_power = sum(bin_powers)
+    total_input_power = float(len(rays_out))
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "s_fraction": req.s_fraction,
+        "detector_half_width": req.detector_half_width,
+        "bin_count": req.bin_count,
+        "bin_width": bin_width,
+        "ray_count": len(rays_out),
+        "hit_count": hit_count,
+        "deposited_count": len(deposited_hits),
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "total_input_power": total_input_power,
+        "received_power": received_power,
+        "unreceived_power": total_input_power - received_power,
+        "bins": [
+            {"index": i, "center": center, "power": power}
+            for i, (center, power) in enumerate(zip(centers, bin_powers))
+        ],
         "rays": rays_out,
     }
 

@@ -141,6 +141,46 @@ def ray_transmittance(
     return t_s, t_p
 
 
+def power_binning(
+    hits: list[tuple[float, float]],
+    half_width: float,
+    bin_count: int,
+) -> tuple[list[float], list[float]]:
+    """将命中功率按有符号坐标在相邻分箱中心间线性分配（边缘截断，不丢功率）。
+
+    探测区间为闭区间 [-half_width, +half_width]，bin_count 个分箱等宽
+    （宽度 width = 2·half_width/bin_count），分箱中心
+    c_i = -half_width + (i + 0.5)·width（i = 0..bin_count-1），
+    首末中心分别内缩半个箱宽。
+
+    每条命中 (coordinate, power)（坐标须已在闭区间内）：
+    - 坐标位于相邻中心 c_i 与 c_{i+1} 之间时按线性权重分配：
+      bin[i] += power·(c_{i+1} - s)/width，bin[i+1] += power·(s - c_i)/width；
+    - 坐标落在首中心左侧（或末中心右侧）但仍在探测区间内时，power 全额计入
+      首箱（或末箱），避免边缘功率丢失。
+
+    分配守恒：每条命中分出的功率之和等于其 power，故 sum(bins) 等于全部
+    命中功率之和。bin_count 为 1 时唯一分箱中心在 0，区间内功率全部入该箱。
+    返回 (分箱中心列表, 各箱功率列表)。
+    """
+    width = 2.0 * half_width / bin_count
+    centers = [-half_width + (i + 0.5) * width for i in range(bin_count)]
+    bins = [0.0] * bin_count
+    for s, power in hits:
+        if s <= centers[0]:
+            bins[0] += power  # 首中心左侧（含恰在首中心）：全额入首箱
+        elif s >= centers[-1]:
+            bins[-1] += power  # 末中心右侧（含恰在末中心）：全额入末箱
+        else:
+            i = int((s - centers[0]) / width)
+            if i >= bin_count - 1:
+                i = bin_count - 2  # 浮点兜底：s 紧贴末中心时仍取末段间隔
+            frac = (s - centers[i]) / width
+            bins[i] += power * (1.0 - frac)
+            bins[i + 1] += power * frac
+    return centers, bins
+
+
 def sample_directions(
     center: tuple[float, float],
     half_angle_deg: float,
