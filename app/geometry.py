@@ -260,6 +260,51 @@ def weighted_centroid(
     return (cx, cy)
 
 
+def detector_bin_centers(half_width: float, bin_count: int) -> list[float]:
+    """将探测闭区间 [-half_width, +half_width] 等分为 bin_count 个箱，返回各箱中心。
+
+    箱宽 spacing = 2·half_width/bin_count，第 i 个中心为
+    -half_width + (i + 1/2)·spacing；首、末中心分别距探测范围端点半个箱宽。
+    """
+    spacing = 2.0 * half_width / bin_count
+    return [-half_width + (i + 0.5) * spacing for i in range(bin_count)]
+
+
+def detector_bin_weights(
+    coordinate: float,
+    half_width: float,
+    centers: list[float],
+) -> list[tuple[int, float]] | None:
+    """命中坐标在各分箱间的线性分配权重；坐标越出探测闭区间时返回 None。
+
+    仅当 -half_width ≤ coordinate ≤ +half_width（闭区间，边界计入）时参与
+    分配：坐标位于相邻箱中心 c_i、c_{i+1} 之间时按到两中心的距离线性分配
+    （权重之和为 1）；坐标不大于首个中心（含探测范围左端点）时全量计入
+    首箱，不小于末个中心（含右端点）时全量计入末箱，避免边缘功率丢失。
+    坐标恰好等于某个箱中心时全量计入该箱。单箱时探测范围内的全部功率都
+    计入该箱。
+    """
+    if coordinate < -half_width or coordinate > half_width:
+        return None  # 闭区间之外：不参与沉积
+    count = len(centers)
+    first = centers[0]
+    if count == 1 or coordinate <= first:
+        return [(0, 1.0)]  # 首中心之外（含左端点）：全量计入边缘箱
+    last = centers[-1]
+    if coordinate >= last:
+        return [(count - 1, 1.0)]  # 末中心之外（含右端点）：全量计入边缘箱
+    for i, center in enumerate(centers):
+        if coordinate == center:
+            return [(i, 1.0)]  # 恰好落在箱中心：全量计入该箱
+    # 定位 coordinate 所属的相邻中心对 (centers[idx], centers[idx+1])
+    idx = 0
+    while idx + 2 < count and coordinate > centers[idx + 1]:
+        idx += 1
+    w_next = (coordinate - centers[idx]) / (centers[idx + 1] - centers[idx])
+    w_next = min(max(w_next, 0.0), 1.0)  # 数值兜底
+    return [(idx, 1.0 - w_next), (idx + 1, w_next)]
+
+
 def trace_ray(
     start: tuple[float, float],
     direction: tuple[float, float],

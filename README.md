@@ -33,6 +33,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
 | POST | `/api/aperture-beam-evaluations` | 复用光束采样与顺序界面追迹，逐界面检查正的口径半宽，越出时在首个失败界面终止，返回各光线状态、首个失败界面序号、切向偏移与光斑统计（不入库） |
 | POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
+| POST | `/api/power-binnings` | 复用光束扇形采样、顺序界面追迹与菲涅耳 s/p 透过率，将探测线命中光线的功率按命中坐标线性分配到相邻分箱，返回各箱功率、接收总功率与未接收功率（不入库） |
 | POST | `/api/wavefront-evaluations` | 复用光束采样与追迹，计算各光线到观察线的光程，对 (切向偏移, 光程) 做等权最小二乘直线拟合，返回截距、斜率、逐光线残差与残差 RMS（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
@@ -345,6 +346,89 @@ curl -X POST http://localhost:8000/api/power-evaluations \
 - `rays[].transmittance_s` / `transmittance_p`：该光线逐界面累乘的 s/p 总透过率（`0～1`）；全反射或漏过界面时为 `0`；无界面时为 `1`。
 - `rays[].power`：按 `s_fraction` 混合后的该光线功率；`observation_point` 为观察线前向交点，无效时为 `null`。
 
+## 探测线功率分箱
+
+`POST /api/power-binnings` 在功率评估请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数、`s_fraction`）基础上增加**探测半宽** `detector_half_width`（必须为正）与**分箱数** `bin_count`（1～200），沿用光束扇形采样、顺序界面追迹与菲涅耳 s/p 透过率计算，将命中探测线的光线功率按命中位置沉积到各分箱。该接口为即时计算，结果不写入数据库。
+
+- **有符号坐标**：探测线即观察线，其法线归一化后**逆时针旋转 90°** 得单位切向量 `t = (-ny, nx)`（响应中回显为 `tangent`）；命中点坐标 `coordinate = (观察线交点 − 观察线给定点) · t`。
+- **探测范围与分箱中心**：有效探测区为以观察线给定点为中心、沿 `t` 展开的**闭区间** `[-detector_half_width, +detector_half_width]`（**边界计入**），等分为 `bin_count` 个箱；箱宽 `spacing = 2·detector_half_width/bin_count`，第 `i` 个箱中心为 `-half_width + (i + 1/2)·spacing`（首、末中心距探测范围端点各半个箱宽）。
+- **参与沉积的光线**：仅**追迹完成**（`completed`）、出射段与观察线有**前向交点**且坐标位于闭区间内的光线参与沉积；全反射 / 漏过界面 / 无观察线前向交点 / 坐标越出探测范围的光线功率计入未接收功率，不进入任何箱。
+- **线性分配**：光线透过功率 `power = s_fraction·Ts + (1 - s_fraction)·Tp`（定义同功率评估，全反射或漏过界面时为 0）。命中坐标位于相邻箱中心 `c_i、c_{i+1}` 之间时，按到两中心的距离线性分配（`w_i = (c_{i+1} - x)/spacing`、`w_{i+1} = (x - c_i)/spacing`，权重之和为 1）；坐标**不大于首个中心**（含探测范围左端点）时**全量计入首箱**，**不小于末个中心**（含右端点）时**全量计入末箱**——落在首末中心之外但仍在探测范围内的边缘功率不会丢失。`bin_count = 1` 时探测范围内功率全量计入唯一箱。
+- **功率核算**：`received_power` 为各箱功率之和（等于全部参与沉积光线的功率之和）；`total_input_power` 恒等于采样光线数（每条入射功率为 1）；`unreceived_power = total_input_power - received_power`，包含未完成追迹、未命中观察线、越出探测范围及界面反射损失的全部功率。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/power-binnings` | 扇形采样、逐条追迹并计算菲涅耳透过功率，按探测线命中坐标线性分箱，返回各箱功率、接收总功率与未接收功率 |
+
+### 探测线功率分箱请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/power-binnings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 5,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "s_fraction": 0.5,
+    "detector_half_width": 2.0,
+    "bin_count": 5
+  }'
+```
+
+### 探测线功率分箱响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 5,
+  "s_fraction": 0.5,
+  "detector_half_width": 2.0,
+  "bin_count": 5,
+  "tangent": {"x": 0.0, "y": 1.0},
+  "ray_count": 5,
+  "hit_count": 5,
+  "total_input_power": 5.0,
+  "received_power": 4.607942624633463,
+  "unreceived_power": 0.3920573753665372,
+  "bins": [
+    {"bin_index": 0, "center": -1.6, "power": 0.9403662339249087},
+    {"bin_index": 1, "center": -0.8, "power": 0.9028050783918228},
+    {"bin_index": 2, "center": 0.0, "power": 0.9216},
+    {"bin_index": 3, "center": 0.8, "power": 0.9028050783918232},
+    {"bin_index": 4, "center": 1.6, "power": 0.9403662339249083}
+  ],
+  "rays": [
+    {
+      "emission_angle_deg": -10.0,
+      "direction": {"x": 0.984807753012208, "y": -0.17364817766693033},
+      "status": "completed",
+      "reason": null,
+      "transmittance_s": 0.918416539493318,
+      "transmittance_p": 0.9247294040133414,
+      "power": 0.9215729717533296,
+      "observation_point": {"x": 10.0, "y": -1.6437139662827691},
+      "coordinate": -1.6437139662827691,
+      "bins": [
+        {"bin_index": 0, "center": -1.6, "power": 0.9215729717533296}
+      ]
+    }
+  ]
+}
+```
+
+- `tangent`：探测线（观察线）单位切向量，`coordinate` 的正方向；`hit_count` 为参与沉积的光线数。
+- `bins[]` 按箱序号排列，每项含 `bin_index`、`center`（箱中心的有符号坐标）与 `power`（沉积到该箱的功率之和）；箱数与 `bin_count` 相同，空箱功率为 `0`。
+- `received_power`：接收总功率，恒等于 `bins[].power` 之和，也等于全部参与沉积光线的功率之和；`unreceived_power` 为以采样光线数为入射总功率（`total_input_power`）计算的未接收功率。
+- `rays[]` 字段同功率评估，另含 `coordinate`（命中点有符号坐标；无观察线前向交点时为 `null`）与 `bins`（该光线功率实际沉积的 1～2 个箱及各箱分得功率；不参与沉积时为 `null`）。追迹完成但坐标越出探测范围时，`observation_point` 与 `coordinate` 仍正常返回，仅 `bins` 为 `null`。
+- 参数校验：`detector_half_width` 必须为正、`bin_count` 取值 1～200，非法时返回 `422`；其余字段校验同功率评估。
+
 ## 波前光程差评估
 
 `POST /api/wavefront-evaluations` 沿用光束请求的**起点、扇形采样（中心方向、对称半角、采样数）、顺序界面与观察线**参数（无额外字段），逐条复用同一套追迹逻辑，评估每条光线从起点到观察线的**光程**，并以观察线切向偏移为横坐标对有效光线的光程做**等权最小二乘直线拟合**。该接口为即时计算，结果不写入数据库。
@@ -621,7 +705,7 @@ curl -X POST http://localhost:8000/api/focus-searches \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线分箱中心与功率线性分配、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
